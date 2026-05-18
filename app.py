@@ -3,9 +3,18 @@ from groq import Groq
 import fitz
 import os
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_groq import ChatGroq
+import tempfile
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# ---- FUNCTIONS ----
 
 def extract_text_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.read()
@@ -18,7 +27,6 @@ def extract_text_from_pdf(uploaded_file):
 def analyze_resume(resume_text, job_description):
     prompt = f"""
 You are an expert resume coach and ATS specialist.
-
 Analyze this resume against the job description below.
 
 RESUME:
@@ -101,7 +109,6 @@ Ask ONE interview question at a time.
 Questions should progress from basic to advanced.
 Keep questions concise and clear.
 You are on question number {question_num} of 5."""
-
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -129,7 +136,7 @@ WHAT_WAS_MISSING:
 [1-2 sentences on what was missing]
 
 IDEAL_ANSWER_HINT:
-[2-3 sentences giving hints about the ideal answer without giving it away completely]
+[2-3 sentences giving hints about the ideal answer]
 """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -162,6 +169,42 @@ def parse_evaluation(evaluation):
         elif current_section and line:
             result[current_section] += line + " "
     return result
+
+def process_uploaded_pdfs(uploaded_files):
+    docs = []
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_path = tmp_file.name
+        loader = PyMuPDFLoader(tmp_path)
+        docs.extend(loader.load())
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50
+    )
+    chunks = text_splitter.split_documents(docs)
+    return chunks
+
+def create_vector_store(chunks):
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    vector_store = Chroma.from_documents(chunks, embeddings)
+    return vector_store
+
+def answer_question(vector_store, question):
+    llm = ChatGroq(
+        api_key=os.getenv("GROQ_API_KEY"),
+        model_name="llama-3.3-70b-versatile"
+    )
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever
+    )
+    result = qa_chain.invoke({"query": question})
+    return result["result"]
 
 def generate_roadmap(goal, timeframe, current_skills):
     prompt = f"""You are an expert career coach.
@@ -207,7 +250,7 @@ st.set_page_config(page_title="AI Career Copilot", page_icon="🚀", layout="wid
 st.title("🚀 AI Career Copilot")
 st.write("Your AI-powered platform for resume analysis, mock interviews, and personalized learning.")
 
-tab1, tab2, tab3 = st.tabs(["📄 Resume Analyzer", "🎤 Mock Interview", "🗺️ Learning Roadmap"])
+tab1, tab2, tab3, tab4 = st.tabs(["📄 Resume Analyzer", "🎤 Mock Interview", "🗺️ Learning Roadmap", "📚 Knowledge Assistant"])
 
 # ---- TAB 1: Resume Analyzer ----
 with tab1:
@@ -228,7 +271,6 @@ with tab1:
                 resume_text = extract_text_from_pdf(resume_file)
                 result = analyze_resume(resume_text, job_description)
                 parsed = parse_result(result)
-
             st.success("Analysis Complete!")
             st.divider()
             score = parsed["match_score"]
@@ -237,7 +279,6 @@ with tab1:
             st.markdown(f"### :{color}[{score}/100]")
             st.progress(score/100)
             st.divider()
-
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.subheader("✅ Strong Points")
@@ -251,7 +292,6 @@ with tab1:
                 st.subheader("⚠️ Weak Sections")
                 for section in parsed["weak_sections"]:
                     st.warning(section)
-
             st.divider()
             st.subheader("💡 Improvement Suggestions")
             for i, suggestion in enumerate(parsed["improvement_suggestions"], 1):
@@ -307,7 +347,6 @@ with tab2:
             st.subheader(f"Question {st.session_state.question_num}:")
             st.markdown(f"**{st.session_state.current_question}**")
             answer = st.text_area("Your Answer:", height=150, key=f"answer_{st.session_state.question_num}")
-
             if st.button("Submit Answer ➡️", use_container_width=True):
                 if answer.strip() == "":
                     st.warning("Please write your answer first.")
@@ -320,7 +359,6 @@ with tab2:
                         )
                         parsed_eval = parse_evaluation(evaluation)
                         st.session_state.scores.append(parsed_eval["score"])
-
                     st.divider()
                     score_color = "green" if parsed_eval["score"] >= 7 else "orange" if parsed_eval["score"] >= 5 else "red"
                     st.markdown(f"### Score: :{score_color}[{parsed_eval['score']}/10]")
@@ -331,9 +369,7 @@ with tab2:
                         st.error(f"❌ **What was missing:** {parsed_eval['what_was_missing']}")
                     st.info(f"💡 **Hint:** {parsed_eval['ideal_answer_hint']}")
                     st.divider()
-
                     st.session_state.conversation_history.append({"role": "user", "content": answer})
-
                     if st.session_state.question_num < 5:
                         st.session_state.question_num += 1
                         with st.spinner("Getting next question..."):
@@ -369,7 +405,6 @@ with tab2:
 with tab3:
     st.header("🗺️ Personalized Learning Roadmap")
     st.write("Tell us your goal and we'll generate a custom preparation plan.")
-
     goal = st.selectbox("What's your target?", [
         "Software Engineering Internship",
         "Data Science Internship",
@@ -386,7 +421,6 @@ with tab3:
         "6 months"
     ])
     current_skills = st.text_input("What skills do you already have? (e.g. Python, basic HTML)")
-
     if st.button("🗺️ Generate My Roadmap", use_container_width=True):
         if current_skills.strip() == "":
             st.warning("Please enter your current skills.")
@@ -396,3 +430,49 @@ with tab3:
             st.success("Your Roadmap is Ready!")
             st.divider()
             st.markdown(roadmap)
+
+# ---- TAB 4: Knowledge Assistant ----
+with tab4:
+    st.header("📚 RAG Knowledge Assistant")
+    st.write("Upload your notes, PDFs, or interview experiences and chat with them using AI.")
+
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    uploaded_pdfs = st.file_uploader(
+        "Upload your study materials (PDFs)",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
+
+    if st.button("📥 Process Documents", use_container_width=True):
+        if not uploaded_pdfs:
+            st.warning("Please upload at least one PDF.")
+        else:
+            with st.spinner("Processing your documents..."):
+                chunks = process_uploaded_pdfs(uploaded_pdfs)
+                st.session_state.vector_store = create_vector_store(chunks)
+            st.success(f"✅ {len(uploaded_pdfs)} document(s) processed! You can now ask questions.")
+
+    if st.session_state.vector_store is not None:
+        st.divider()
+        st.subheader("💬 Chat with your documents")
+
+        for message in st.session_state.chat_history:
+            if message["role"] == "user":
+                st.chat_message("user").write(message["content"])
+            else:
+                st.chat_message("assistant").write(message["content"])
+
+        question = st.chat_input("Ask anything from your uploaded documents...")
+        if question:
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            st.chat_message("user").write(question)
+            with st.spinner("Searching your documents..."):
+                answer = answer_question(st.session_state.vector_store, question)
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").write(answer)
+    else:
+        st.info("👆 Upload and process your documents first to start chatting.")
